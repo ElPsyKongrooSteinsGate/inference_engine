@@ -400,9 +400,9 @@ public:
         std::ifstream file(path, std::ios::binary);
         if (!file.is_open()) return false;
 
-        uint32_t max_token_len = 0;
+        int32_t max_token_len = 0;
         if (!file.read(reinterpret_cast<char*>(&max_token_len), sizeof(max_token_len)) ||
-            vocab_size <= 0) return false;
+            vocab_size < 3 || max_token_len <= 0 || max_token_len > (1 << 20)) return false;
 
         vocab.clear(); vocab_scores.clear(); token_to_id.clear();
         vocab.reserve(vocab_size); vocab_scores.reserve(vocab_size);
@@ -411,10 +411,11 @@ public:
             float score = 0.0f;
             int32_t len = 0;
             if (!file.read(reinterpret_cast<char*>(&score), sizeof(score)) ||
-                !file.read(reinterpret_cast<char*>(&len), sizeof(len))) return false;
+                !file.read(reinterpret_cast<char*>(&len), sizeof(len)) ||
+                len < 0 || len > max_token_len) return false;
 
             std::string token(static_cast<size_t>(len), '\0');
-            if (len > 0 && !file.read(token.data(), len)) return false;
+            if (len > 0 && !file.read(token.data(), static_cast<std::streamsize>(len))) return false;
 
             vocab_scores.push_back(score);
             token_to_id[token] = i;
@@ -429,64 +430,88 @@ public:
         return -1;
     }
 
-    std::string decode(int token_id) const {
-        if (token_id == 1 || token_id == 2) return "";
+    std::string decode(int token_id, int previous_token = -1) const {
         if (token_id < 0 || token_id >= static_cast<int>(vocab.size())) return "";
-        std::string s = vocab[token_id];
-        if (s.rfind("\xE2\x96\x81", 0) == 0) {
-            s = " " + s.substr(3);
+        std::string piece = vocab[token_id];
+        if (previous_token == 1 && !piece.empty() && piece[0] == ' ') piece.erase(0, 1);
+
+        // llama2.c represents byte-fallback tokens as strings such as <0xC3>.
+        if (piece.size() == 6 && piece[0] == '<' && piece[1] == '0' &&
+            (piece[2] == 'x' || piece[2] == 'X') && piece[5] == '>') {
+            auto hex_value = [](char c) -> int {
+                if (c >= '0' && c <= '9') return c - '0';
+                if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                return -1;
+            };
+            int hi = hex_value(piece[3]), lo = hex_value(piece[4]);
+            if (hi >= 0 && lo >= 0) return std::string(1, static_cast<char>((hi << 4) | lo));
         }
-        return s;
+        return piece;
     }
 
-    // Dynamic SentencePiece BPE encoding for arbitrary user text
+    // Matches llama2.c: add a space-token prefix, encode UTF-8 codepoints,
+    // byte-fallback unknown codepoints, then repeatedly merge the best pair.
     std::vector<int> encode(const std::string& text) const {
-        std::vector<int> tokens = {1}; // BOS token ID
+        std::vector<int> tokens{1}; // BOS token ID
         if (text.empty()) return tokens;
 
-        // Prepends SentencePiece leading space indicator '\xE2\x96\x81'
-        std::string formatted_input = "\xE2\x96\x81" + text;
+        const int dummy_prefix = find_token(" ");
+        if (dummy_prefix < 0) throw std::runtime_error("Tokenizer vocabulary has no space prefix token");
+        tokens.push_back(dummy_prefix);
 
-        // Initialize sequence with single-byte tokens
-        std::vector<std::string> str_tokens;
-        for (size_t i = 0; i < formatted_input.size(); ++i) {
-            str_tokens.push_back(std::string(1, formatted_input[i]));
-        }
+        auto append_byte_fallback = [&](unsigned char byte) {
+            static constexpr char hex[] = "0123456789ABCDEF";
+            std::string byte_piece{"<0x00>"};
+            byte_piece[3] = hex[byte >> 4];
+            byte_piece[4] = hex[byte & 0x0F];
+            int id = find_token(byte_piece);
+            if (id < 0) throw std::runtime_error("Tokenizer vocabulary is missing byte fallback token " + byte_piece);
+            tokens.push_back(id);
+        };
 
-        // Iterative BPE merging based on vocabulary scores
-        while (str_tokens.size() > 1) {
-            float best_score = -1e9f;
-            int best_idx = -1;
-            int best_merged_id = -1;
+        for (size_t i = 0; i < text.size();) {
+            const unsigned char lead = static_cast<unsigned char>(text[i]);
+            size_t codepoint_len = 1;
+            if ((lead & 0xE0) == 0xC0) codepoint_len = 2;
+            else if ((lead & 0xF0) == 0xE0) codepoint_len = 3;
+            else if ((lead & 0xF8) == 0xF0) codepoint_len = 4;
 
-            for (size_t i = 0; i < str_tokens.size() - 1; ++i) {
-                std::string merged = str_tokens[i] + str_tokens[i + 1];
-                int id = find_token(merged);
-                if (id >= 0 && vocab_scores[id] > best_score) {
-                    best_score = vocab_scores[id];
-                    best_idx = static_cast<int>(i);
-                    best_merged_id = id;
-                }
+            bool valid_codepoint = i + codepoint_len <= text.size();
+            for (size_t j = 1; valid_codepoint && j < codepoint_len; ++j) {
+                const unsigned char continuation = static_cast<unsigned char>(text[i + j]);
+                if ((continuation & 0xC0) != 0x80) valid_codepoint = false;
             }
+            if (!valid_codepoint) codepoint_len = 1;
 
-            if (best_idx == -1) break; // No further vocabulary pairs to merge
-
-            str_tokens[best_idx] = vocab[best_merged_id];
-            str_tokens.erase(str_tokens.begin() + best_idx + 1);
-        }
-
-        for (const auto& tok : str_tokens) {
-            int id = find_token(tok);
+            const std::string codepoint = text.substr(i, codepoint_len);
+            const int id = find_token(codepoint);
             if (id >= 0) {
                 tokens.push_back(id);
             } else {
-                // Byte fallback for unmatched individual bytes
-                for (unsigned char c : tok) {
-                    std::string byte_tok(1, static_cast<char>(c));
-                    int byte_id = find_token(byte_tok);
-                    if (byte_id >= 0) tokens.push_back(byte_id);
+                for (size_t j = 0; j < codepoint_len; ++j)
+                    append_byte_fallback(static_cast<unsigned char>(text[i + j]));
+            }
+            i += codepoint_len;
+        }
+
+        while (tokens.size() > 1) {
+            float best_score = -std::numeric_limits<float>::infinity();
+            int best_idx = -1;
+            int best_id = -1;
+            for (int i = 0; i + 1 < static_cast<int>(tokens.size()); ++i) {
+                const std::string merged = vocab[tokens[i]] + vocab[tokens[i + 1]];
+                const int id = find_token(merged);
+                if (id >= 0 && vocab_scores[id] > best_score) {
+                    best_score = vocab_scores[id];
+                    best_idx = i;
+                    best_id = id;
                 }
             }
+
+            if (best_idx < 0) break;
+            tokens[best_idx] = best_id;
+            tokens.erase(tokens.begin() + best_idx + 1);
         }
 
         return tokens;
@@ -676,10 +701,12 @@ int main(int argc, char* argv[]) {
         pos += prompt.size();
 
         for (int t : prompt) ++token_counts[t];
+        int previous_token = prompt.back();
 
         int next_token = sample_next_token(logits, rng, token_counts, temperature, top_k, 1.25f);
         if (next_token != 1 && next_token != 2) {
-            std::cout << tokenizer.decode(next_token) << std::flush;
+            std::cout << tokenizer.decode(next_token, previous_token) << std::flush;
+            previous_token = next_token;
             ++token_counts[next_token];
             ++generated_tokens;
         }
@@ -691,7 +718,8 @@ int main(int argc, char* argv[]) {
             ++pos;
             next_token = sample_next_token(logits, rng, token_counts, temperature, top_k, 1.25f);
             if (next_token == 1 || next_token == 2) break;
-            std::cout << tokenizer.decode(next_token) << std::flush;
+            std::cout << tokenizer.decode(next_token, previous_token) << std::flush;
+            previous_token = next_token;
             ++token_counts[next_token];
             ++generated_tokens;
         }
